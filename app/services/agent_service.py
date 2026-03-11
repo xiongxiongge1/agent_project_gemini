@@ -1,10 +1,12 @@
 import json
 import re
 from typing import List, Dict
-from openai import AsyncOpenAI
+from langfuse.openai import AsyncOpenAI  # 替换成 Langfuse 的魔法包装器
+from langfuse import observe # 导入追踪装饰器
 from app.core.config import settings
 from app.tools.base_tools import AVAILABLE_TOOLS
 from app.services.memory_service import RedisMemoryService
+from app.services.security_service import SecurityService # 1. 导入安全服务
 import tiktoken 
 
 class ReActAgent:
@@ -19,6 +21,7 @@ class ReActAgent:
         self.summarizes: Dict[str, List[dict]] = {}
         self.summary_threshold = 6 # 每次将最老的 6 条摘要成一段话
         self.memory_service = RedisMemoryService()
+        self.security_service = SecurityService()
         self.base_system_prompt  = """你是一个具备思考能力的 AI 助手。你可以使用以下工具：
             1. get_weather: 参数 {"city": "城市名称"}
             2. get_stock_price: 参数 {"symbol": "股票代码"}
@@ -29,7 +32,10 @@ class ReActAgent:
             Action Input: 工具参数 (JSON 格式)
             Observation: 工具返回的结果
             ... (重复上述步骤直到获得答案)
-            Final Answer: 最终给用户的回答"""
+            Final Answer: 最终给用户的回答
+            注意：最后的答案，请用 "Final Answer: " 开头。
+            注意：请勿在答案中添加任何多余的文本
+            """  
 
 
     async def _get_summary_model_response(self, content_to_summarize: str) -> str:
@@ -123,9 +129,28 @@ class ReActAgent:
         num_tokens += 2  # 所有的回答都以 <|start|>assistant 开头
         return num_tokens
 
+    @observe(name="Agent ReAct Loop")
     async def run(self, query: str, session_id: str):
+        
         # 初始化会话
         # self._init_session(session_id)
+        print(f"\n[Session: {session_id}] New Query: {query}")
+        print("-" * 50)
+        # 3. 新增：安全护栏拦截逻辑
+        # ==========================================
+        is_safe = await self.security_service.check_prompt_injection(query)
+        if not is_safe:
+            # 如果不安全，直接中断流程，返回警告，不再消耗大模型的 token
+            warning_msg = "⚠️ [安全拦截] 您的输入包含违规指令或尝试绕过系统限制的企图，已被安全网关拒绝。"
+            print(warning_msg)
+            
+            # 使用 yield 推送给前端
+            yield f"data: {json.dumps({'type': 'thought', 'content': '系统正在进行安全校验...'}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'observation', 'content': warning_msg}, ensure_ascii=False)}\n\n"
+            
+            # 存入记忆（可选，记录黑历史）
+            await self.memory_service.add_interaction(session_id, query, warning_msg)
+            return  # 提前结束 run 方法！
         chat_history = await self.memory_service.get_history(session_id)
         # 获取当前摘要
         current_summary = self.summarizes.get(session_id, "暂无背景信息")
@@ -210,7 +235,8 @@ class ReActAgent:
                 working_messages.append({"role": "user", "content": f"Observation: {observation}"})
             else:
                 # 如果模型没有按格式回复，强制结束防止死循环
-                print("[System]: Format Error, stopping.")
+                print("\033[93m[System]: 模型未严格遵循格式，触发容错机制，强制结束并返回当前内容。\033[0m")
+                final_answer = content.replace("Thought:", "").strip()
                 break
         # 3. 任务结束：将“干净”的结果存入长时记忆
         # 这样下次请求时，history 里只有 User 的问题和 Assistant 的最终回答

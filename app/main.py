@@ -1,7 +1,8 @@
 import uvicorn
 from fastapi import FastAPI
 from app.api.router import api_router
-
+from dotenv import load_dotenv
+load_dotenv()
 app = FastAPI(title="Agent API Service")
 
 # 引入路由
