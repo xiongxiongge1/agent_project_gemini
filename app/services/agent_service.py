@@ -4,6 +4,7 @@ from typing import List, Dict
 from openai import AsyncOpenAI
 from app.core.config import settings
 from app.tools.base_tools import AVAILABLE_TOOLS
+from app.services.memory_service import RedisMemoryService
 import tiktoken 
 
 class ReActAgent:
@@ -17,6 +18,7 @@ class ReActAgent:
         # 摘要存储：{session_id: "之前谈话的简要背景..."}
         self.summarizes: Dict[str, List[dict]] = {}
         self.summary_threshold = 6 # 每次将最老的 6 条摘要成一段话
+        self.memory_service = RedisMemoryService()
         self.base_system_prompt  = """你是一个具备思考能力的 AI 助手。你可以使用以下工具：
             1. get_weather: 参数 {"city": "城市名称"}
             2. get_stock_price: 参数 {"symbol": "股票代码"}
@@ -46,7 +48,7 @@ class ReActAgent:
     
     async def _get_manage_memory(self, session_id: str):
         """核心记忆管理逻辑：摘要 + 修剪"""
-        history = self.memory.get(session_id, [])
+        history = await self.memory_service.get_history(session_id)
         # 如果历史消息（除去 System）超过阈值
         real_history = [msg for msg in history if msg["role"] != "system"]
         if len(real_history) > self.max_history_len:
@@ -70,6 +72,9 @@ class ReActAgent:
 
             # 5. 更新内容： System Prompt + 新的历史记录
             self.memory[session_id]  =[history[0]] + remaining
+            # self.memory_sevice.clear_history(session_id)
+            # TODO 如何把简化后的历史记录存储到redis中
+            # await self.memory_service.add_interaction(session_id, text_to_summarize, new_chunk_summary)
             print(f"[Memory] 新摘要已生成: {new_chunk_summary}")
 
     def _init_session(self, session_id: str):
@@ -120,8 +125,8 @@ class ReActAgent:
 
     async def run(self, query: str, session_id: str):
         # 初始化会话
-        self._init_session(session_id)
-        
+        # self._init_session(session_id)
+        chat_history = await self.memory_service.get_history(session_id)
         # 获取当前摘要
         current_summary = self.summarizes.get(session_id, "暂无背景信息")
 
@@ -132,11 +137,9 @@ class ReActAgent:
         """
         # 构造本次请求的上下文
         working_messages = []
-        for msg in self.memory[session_id]:
-            if msg["role"] == "system":
-                working_messages.append({"role": "system", "content": dynamic_system_prompt})
-            else:
-                working_messages.append(msg)
+        working_messages.append({"role": "system", "content": dynamic_system_prompt})
+        for msg in chat_history:
+            working_messages.append(msg)
         working_messages.append({"role": "user", "content": query})
         # 1. 获取裁剪后的长时记忆
         # messages = self._get_clean_history(session_id)
@@ -211,11 +214,13 @@ class ReActAgent:
                 break
         # 3. 任务结束：将“干净”的结果存入长时记忆
         # 这样下次请求时，history 里只有 User 的问题和 Assistant 的最终回答
-        self.memory[session_id].append({"role": "user", "content": query})
-        self.memory[session_id].append({"role": "assistant", "content": f"Final Answer: {final_answer}"})
+        # self.memory[session_id].append({"role": "user", "content": query})
+        await self.memory_service.add_interaction(session_id, query, final_answer)
+        # self.memory[session_id].append({"role": "assistant", "content": f"Final Answer: {final_answer}"})
         # 检查是否需要压缩记忆到摘要
-        current_tokens = self._num_tokens_from_messages(self.memory[session_id])
-        print(f"[Monitor] 当前会话 Token 数: {current_tokens}")
-        if current_tokens > 2000: # 假设 2000 是你的预警线
-            await self._get_manage_memory(session_id)
-        print(f"[System]: Memory updated. Current count: {len(self.memory[session_id])}")
+        # current_history = await self.memory_service.get_history(session_id)
+        # current_tokens = self._num_tokens_from_messages(current_history)
+        # print(f"[Monitor] 当前会话 Token 数: {current_tokens}")
+        # if current_tokens > 2000: # 假设 2000 是你的预警线
+        #     await self._get_manage_memory(session_id)
+        # print(f"[System]: Memory updated. Current count: {len(current_history)}")
